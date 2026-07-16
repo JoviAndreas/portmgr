@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""
+portmgr - Docker Compose port registry manager
+Range: 10000-19999 | Max 10 ports/project | 100+ projects supported
+
+Usage:
+  portmgr alloc <project> <svc> [<svc> ...] [--hostname <host>]
+                                               Allocate ports, write .env + compose stub
+  portmgr free <project>                       Release project's ports
+  portmgr list                                 Show all projects
+  portmgr show <project>                       Show project ports + env vars
+  portmgr set-hostname <project> <hostname>    Override project hostname
+  portmgr hosts                                Print /etc/hosts entries for LAN clients
+  portmgr nginx-conf                           Regenerate Caddy vhost configs + reload
+  portmgr init [--domain <domain>] [--ip <ip>] Initialize registry
+
+Registry keys (~/.portmgr/registry.json) you can set by hand:
+  domain          base domain for hostnames (default: local.test)
+  bind_ip         IP printed by `portmgr hosts` (default: 127.0.0.1)
+  tls_cert/tls_key  optional cert paths; if set, Caddy vhosts serve TLS
+  post_alloc_hook   optional script run after `alloc` with the project name
+"""
+
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+REGISTRY_DIR = Path.home() / ".portmgr"
+REGISTRY_FILE = REGISTRY_DIR / "registry.json"
+CADDY_CONF_DIR = Path("/etc/caddy/conf.d")
+RANGE_START = 10000
+RANGE_END = 19999
+MAX_PER_PROJECT = 10
+DEFAULT_DOMAIN = "local.test"
+DEFAULT_BIND_IP = "127.0.0.1"
+
+
+# ── registry ──────────────────────────────────────────────────────────────────
+
+def load_registry():
+    if not REGISTRY_FILE.exists():
+        return {
+            "range_start": RANGE_START,
+            "range_end": RANGE_END,
+            "max_per_project": MAX_PER_PROJECT,
+            "domain": DEFAULT_DOMAIN,
+            "bind_ip": DEFAULT_BIND_IP,
+            "projects": {},
+        }
+    with open(REGISTRY_FILE) as f:
+        return json.load(f)
+
+
+def save_registry(reg):
+    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    with open(REGISTRY_FILE, "w") as f:
+        json.dump(reg, f, indent=2)
+
+
+def used_ports(reg):
+    used = set()
+    for p in reg["projects"].values():
+        used.update(p["ports"].values())
+    return used
+
+
+def next_free_ports(reg, count):
+    used = used_ports(reg)
+    found = []
+    for port in range(reg["range_start"], reg["range_end"] + 1):
+        if port not in used:
+            found.append(port)
+        if len(found) == count:
+            return found
+    return None
+
+
+def next_free_ports_excluding(reg, count, exclude):
+    used = used_ports(reg) | exclude
+    found = []
+    for port in range(reg["range_start"], reg["range_end"] + 1):
+        if port not in used:
+            found.append(port)
+        if len(found) == count:
+            return found
+    return None
+
+
+def default_hostname(project, domain):
+    return f"{project}.{domain}"
+
+
+def proxy_port(data):
+    """Return the web-facing port: prefer 'web' service, else first."""
+    ports = data["ports"]
+    if "web" in ports:
+        return ports["web"]
+    return next(iter(ports.values()))
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_init(args):
+    domain = DEFAULT_DOMAIN
+    bind_ip = None
+    if "--domain" in args:
+        idx = args.index("--domain")
+        domain = args[idx + 1]
+    if "--ip" in args:
+        idx = args.index("--ip")
+        bind_ip = args[idx + 1]
+
+    if REGISTRY_FILE.exists():
+        reg = load_registry()
+        changed = False
+        if "--domain" in args:
+            reg["domain"] = domain
+            changed = True
+        if bind_ip:
+            reg["bind_ip"] = bind_ip
+            changed = True
+        if changed:
+            save_registry(reg)
+            print(f"Registry updated (domain={reg['domain']}, bind_ip={reg.get('bind_ip', DEFAULT_BIND_IP)})")
+        else:
+            print("Registry already exists:", REGISTRY_FILE)
+        return
+
+    reg = {
+        "range_start": RANGE_START,
+        "range_end": RANGE_END,
+        "max_per_project": MAX_PER_PROJECT,
+        "domain": domain,
+        "bind_ip": bind_ip or DEFAULT_BIND_IP,
+        "projects": {},
+    }
+    save_registry(reg)
+    print("Initialized:", REGISTRY_FILE)
+    print(f"Domain: {domain}")
+
+
+def cmd_alloc(args):
+    # Parse --hostname flag
+    hostname_override = None
+    if "--hostname" in args:
+        idx = args.index("--hostname")
+        hostname_override = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    if len(args) < 2:
+        print("Usage: portmgr alloc <project> <service> [<service> ...] [--hostname <host>]")
+        sys.exit(1)
+
+    project = args[0].lower()
+    services = args[1:]
+
+    if len(services) > MAX_PER_PROJECT:
+        print(f"Error: max {MAX_PER_PROJECT} ports/project, requested {len(services)}")
+        sys.exit(1)
+
+    reg = load_registry()
+    domain = reg.get("domain", DEFAULT_DOMAIN)
+
+    if project in reg["projects"]:
+        existing = reg["projects"][project]
+        existing_services = set(existing["ports"].keys())
+        requested_services = set(services)
+
+        if hostname_override:
+            existing["hostname"] = hostname_override
+
+        if existing_services == requested_services:
+            print(f"Project '{project}' already allocated (unchanged).")
+            if hostname_override:
+                save_registry(reg)
+            _print_project(project, existing)
+            _write_project_files(project, existing)
+            _caddy_regen(reg)
+            return
+
+        new_services = [s for s in services if s not in existing["ports"]]
+        if new_services:
+            extra_ports = next_free_ports_excluding(reg, len(new_services), set(existing["ports"].values()))
+            if extra_ports is None:
+                print("Error: not enough free ports in range")
+                sys.exit(1)
+            for svc, port in zip(new_services, extra_ports):
+                existing["ports"][svc] = port
+            existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_registry(reg)
+        print(f"Updated '{project}'.")
+        _print_project(project, existing)
+        _write_project_files(project, existing)
+        _caddy_regen(reg)
+        return
+
+    ports = next_free_ports(reg, len(services))
+    if ports is None:
+        print("Error: not enough free ports in range")
+        sys.exit(1)
+
+    hostname = hostname_override or default_hostname(project, domain)
+    entry = {
+        "ports": {svc: port for svc, port in zip(services, ports)},
+        "hostname": hostname,
+        "allocated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    reg["projects"][project] = entry
+    save_registry(reg)
+    print(f"Allocated {len(services)} port(s) for '{project}'.")
+    _print_project(project, entry)
+    _write_project_files(project, entry)
+    _caddy_regen(reg)
+    _post_alloc_hook(reg, project)
+
+
+def _post_alloc_hook(reg, project):
+    """Run optional user-defined hook after allocation (registry key: post_alloc_hook)."""
+    hook = reg.get("post_alloc_hook")
+    if not hook:
+        return
+    hook_path = Path(hook).expanduser()
+    if not hook_path.exists():
+        return
+    try:
+        subprocess.run([str(hook_path), project], check=False)
+    except Exception as e:
+        print(f"(post_alloc_hook failed: {e})")
+
+
+def cmd_free(args):
+    if not args:
+        print("Usage: portmgr free <project>")
+        sys.exit(1)
+    project = args[0].lower()
+    reg = load_registry()
+    if project not in reg["projects"]:
+        print(f"Project '{project}' not found.")
+        sys.exit(1)
+    del reg["projects"][project]
+    save_registry(reg)
+    print(f"Released ports for '{project}'.")
+    _caddy_regen(reg)
+
+
+def cmd_list(_args):
+    reg = load_registry()
+    projects = reg["projects"]
+    if not projects:
+        print("No projects allocated.")
+        return
+    print(f"{'PROJECT':<20} {'HOSTNAME':<35} {'SERVICES'}")
+    print("-" * 90)
+    for name, data in sorted(projects.items()):
+        hostname = data.get("hostname", default_hostname(name, reg.get("domain", DEFAULT_DOMAIN)))
+        svcs = ", ".join(f"{s}:{p}" for s, p in data["ports"].items())
+        print(f"{name:<20} {hostname:<35} {svcs}")
+    print(f"\nTotal: {len(projects)} project(s) | {sum(len(d['ports']) for d in projects.values())} ports used")
+
+
+def cmd_show(args):
+    if not args:
+        print("Usage: portmgr show <project>")
+        sys.exit(1)
+    project = args[0].lower()
+    reg = load_registry()
+    if project not in reg["projects"]:
+        print(f"Project '{project}' not found.")
+        sys.exit(1)
+    _print_project(project, reg["projects"][project])
+
+
+def cmd_set_hostname(args):
+    if len(args) < 2:
+        print("Usage: portmgr set-hostname <project> <hostname>")
+        sys.exit(1)
+    project = args[0].lower()
+    hostname = args[1]
+    reg = load_registry()
+    if project not in reg["projects"]:
+        print(f"Project '{project}' not found.")
+        sys.exit(1)
+    reg["projects"][project]["hostname"] = hostname
+    save_registry(reg)
+    print(f"Hostname for '{project}' set to: {hostname}")
+    _caddy_regen(reg)
+
+
+def cmd_hosts(_args):
+    reg = load_registry()
+    ip = reg.get("bind_ip", DEFAULT_BIND_IP)
+    domain = reg.get("domain", DEFAULT_DOMAIN)
+    print(f"# portmgr - add to /etc/hosts on client machines")
+    print(f"# sudo nano /etc/hosts\n")
+    seen = set()
+    for name, data in sorted(reg["projects"].items()):
+        hostname = data.get("hostname", default_hostname(name, domain))
+        if hostname not in seen:
+            print(f"{ip}  {hostname}")
+            seen.add(hostname)
+
+
+def cmd_nginx_conf(_args):
+    reg = load_registry()
+    _caddy_regen(reg)
+
+
+# ── internal helpers ──────────────────────────────────────────────────────────
+
+def _print_project(project, data):
+    print(f"\n=== {project} ===")
+    print(f"Hostname:  {data.get('hostname', '(none)')}")
+    print(f"Allocated: {data.get('allocated_at', 'unknown')}")
+    print("\n.env vars:")
+    for svc, port in data["ports"].items():
+        key = _env_key(project, svc)
+        print(f"  {key}={port}")
+    print()
+
+
+def _env_key(project, svc):
+    return f"{project.upper().replace('-', '_')}_{svc.upper()}_PORT"
+
+
+def _write_project_files(project, data):
+    out_dir = Path.cwd()
+    env_file = out_dir / f".env.{project}"
+    compose_file = out_dir / f"docker-compose.{project}.yml"
+
+    lines = [f"{_env_key(project, svc)}={port}" for svc, port in data["ports"].items()]
+    env_file.write_text("\n".join(lines) + "\n")
+
+    services_block = ""
+    for svc, port in data["ports"].items():
+        key = _env_key(project, svc)
+        services_block += f"""
+  {svc}:
+    image: {svc}:latest
+    ports:
+      - "${{{key}}}:{_default_internal_port(svc)}"
+    env_file:
+      - .env.{project}
+"""
+    compose_file.write_text(
+        f"# Auto-generated by portmgr\n# Project: {project}\n\nservices:{services_block}\n"
+    )
+    print(f"Written: {env_file.name}")
+    print(f"Written: {compose_file.name}")
+
+
+def _default_internal_port(service):
+    defaults = {
+        "web": 80, "app": 3000, "api": 8000, "frontend": 3000, "backend": 8000,
+        "db": 5432, "postgres": 5432, "mysql": 3306, "mongo": 27017,
+        "redis": 6379, "cache": 6379, "mq": 5672, "rabbitmq": 5672,
+        "nginx": 80, "traefik": 80, "grafana": 3000, "prometheus": 9090,
+    }
+    return defaults.get(service.lower(), 8080)
+
+
+def _caddy_snippet(hostname, data, reg):
+    """Generate Caddy snippet. If project has both 'web' and 'api',
+    route /api* → api port, everything else → web port."""
+    ports = data["ports"]
+    web_port = ports.get("web") or next(iter(ports.values()))
+    api_port = ports.get("api")
+
+    tls_cert = reg.get("tls_cert")
+    tls_key = reg.get("tls_key")
+    tls_line = f"  tls {tls_cert} {tls_key}\n" if tls_cert and tls_key else ""
+
+    if api_port and "web" in ports:
+        return f"""{hostname} {{
+{tls_line}  handle /api* {{
+    reverse_proxy localhost:{api_port} {{
+      flush_interval -1
+    }}
+  }}
+  handle {{
+    reverse_proxy localhost:{web_port} {{
+      flush_interval -1
+    }}
+  }}
+}}
+"""
+    return f"""{hostname} {{
+{tls_line}  reverse_proxy localhost:{web_port} {{
+    flush_interval -1
+  }}
+}}
+"""
+
+
+def _caddy_regen(reg):
+    domain = reg.get("domain", DEFAULT_DOMAIN)
+
+    if not CADDY_CONF_DIR.exists():
+        print(f"(Caddy conf dir {CADDY_CONF_DIR} not found, skipping vhost generation)")
+        return
+
+    # Remove old generated snippets
+    for f in CADDY_CONF_DIR.glob("portmgr-*.caddy"):
+        subprocess.run(["sudo", "rm", str(f)])
+
+    for name, data in reg["projects"].items():
+        hostname = data.get("hostname", default_hostname(name, domain))
+        snippet = _caddy_snippet(hostname, data, reg)
+        tmp = Path(f"/tmp/portmgr-{name}.caddy")
+        tmp.write_text(snippet)
+        subprocess.run(["sudo", "mv", str(tmp), str(CADDY_CONF_DIR / f"portmgr-{name}.caddy")])
+
+    # Reload Caddy
+    result = subprocess.run(
+        ["sudo", "systemctl", "restart", "caddy"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("Caddy restarted.")
+    else:
+        print(f"Caddy restart failed: {result.stderr.strip()}")
+
+    count = len(list(CADDY_CONF_DIR.glob("portmgr-*.caddy")))
+    print(f"Generated {count} Caddy snippet(s) in {CADDY_CONF_DIR}")
+
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "init": cmd_init,
+    "alloc": cmd_alloc,
+    "free": cmd_free,
+    "list": cmd_list,
+    "show": cmd_show,
+    "set-hostname": cmd_set_hostname,
+    "hosts": cmd_hosts,
+    "nginx-conf": cmd_nginx_conf,
+}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = args[0]
+    if cmd not in COMMANDS:
+        print(f"Unknown command: {cmd}")
+        print("Commands:", ", ".join(COMMANDS))
+        sys.exit(1)
+
+    COMMANDS[cmd](args[1:])
+
+
+if __name__ == "__main__":
+    main()
